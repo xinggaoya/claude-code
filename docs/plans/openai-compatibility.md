@@ -2,9 +2,12 @@
 
 ## 概述
 
-claude-code 支持通过 OpenAI Chat Completions API（`/v1/chat/completions`）兼容任意 OpenAI 协议端点，包括 Ollama、DeepSeek、vLLM、One API、LiteLLM 等。
+claude-code 现在支持 **双路径 OpenAI 适配**：
 
-核心策略为**流适配器模式**：在 `queryModel()` 中插入提前返回分支，将 Anthropic 格式请求转为 OpenAI 格式，调用 OpenAI SDK，再将 SSE 流转换回 `BetaRawMessageStreamEvent` 格式。下游代码（流处理循环、query.ts、QueryEngine.ts、REPL）**完全不改**。
+- **Responses API**（`/v1/responses`）：优先用于官方 OpenAI reasoning / GPT-5 / O 系列模型
+- **Chat Completions API**（`/v1/chat/completions`）：继续用于 OpenAI-compatible 网关（Ollama、DeepSeek、vLLM、One API、LiteLLM 等）
+
+核心策略仍然是**流适配器模式**：在 `queryModel()` 中插入提前返回分支，将 Anthropic 格式请求转为 OpenAI 格式，调用 OpenAI SDK，再将 SSE 流转换回 `BetaRawMessageStreamEvent` 格式。下游代码（流处理循环、query.ts、QueryEngine.ts、REPL）**完全不改**。
 
 ## 环境变量
 
@@ -14,6 +17,9 @@ claude-code 支持通过 OpenAI Chat Completions API（`/v1/chat/completions`）
 | `OPENAI_API_KEY` | 是 | API key（Ollama 等可设为任意值） |
 | `OPENAI_BASE_URL` | 推荐 | 端点 URL（如 `http://localhost:11434/v1`） |
 | `OPENAI_MODEL` | 可选 | 覆盖所有请求的模型名（跳过映射） |
+| `OPENAI_REASONING_EFFORT` | 可选 | 给 OpenAI reasoning 模型显式设置 `reasoning_effort`（`none`/`minimal`/`low`/`medium`/`high`/`xhigh`，`auto`/`unset` 表示不发送） |
+| `OPENAI_USE_RESPONSES` | 可选 | 强制 `openai` provider 走 Responses API |
+| `OPENAI_USE_CHAT_COMPLETIONS` | 可选 | 强制 `openai` provider 走 Chat Completions API |
 | `OPENAI_DEFAULT_OPUS_MODEL` | 可选 | 覆盖 opus 家族对应的模型（如 `o3`, `o3-mini`, `o1-pro`） |
 | `OPENAI_DEFAULT_SONNET_MODEL` | 可选 | 覆盖 sonnet 家族对应的模型（如 `gpt-4o`, `gpt-4.1`） |
 | `OPENAI_DEFAULT_HAIKU_MODEL` | 可选 | 覆盖 haiku 家族对应的模型（如 `gpt-4o-mini`, `gpt-4.0-mini`） |
@@ -51,6 +57,14 @@ OPENAI_BASE_URL=https://your-one-api.example.com/v1 \
 OPENAI_MODEL=gpt-4o \
 bun run dev
 
+# OpenAI reasoning 模型（官方 reasoning_effort）
+CLAUDE_CODE_USE_OPENAI=1 \
+OPENAI_API_KEY=sk-your-key \
+OPENAI_BASE_URL=https://api.openai.com/v1 \
+OPENAI_MODEL=gpt-5.4 \
+OPENAI_REASONING_EFFORT=xhigh \
+bun run dev
+
 # 自定义模型映射（使用家族变量）
 CLAUDE_CODE_USE_OPENAI=1 \
 OPENAI_API_KEY=sk-xxx \
@@ -62,6 +76,18 @@ bun run dev
 
 ## 架构
 
+### 路由规则
+
+默认情况下：
+
+- 若模型看起来是 **官方 OpenAI 模型**（如 `gpt-5.*`、`o3`、`o4-mini`、`codex-*`），且 `OPENAI_BASE_URL` 未设置或仍指向 `api.openai.com`，则优先走 **Responses API**
+- 其他 OpenAI-compatible 端点继续走 **Chat Completions**
+
+可通过环境变量强制覆盖：
+
+- `OPENAI_USE_RESPONSES=1`
+- `OPENAI_USE_CHAT_COMPLETIONS=1`
+
 ### 请求流程
 
 ```
@@ -70,17 +96,19 @@ queryModel() [claude.ts]
   └── if (getAPIProvider() === 'openai')
       └── queryModelOpenAI() [openai/index.ts]
           ├── resolveOpenAIModel()          → 解析模型名
+          ├── shouldUseOpenAIResponsesAPI() → 选择 responses / chat
           ├── normalizeMessagesForAPI()      → 共享消息预处理
           ├── toolToAPISchema()              → 构建工具 schema
-          ├── anthropicMessagesToOpenAI()    → 消息格式转换
-          ├── anthropicToolsToOpenAI()       → 工具格式转换
-          ├── openai.chat.completions.create({ stream: true })
-          └── adaptOpenAIStreamToAnthropic() → 流格式转换
-              ├── delta.reasoning_content    → thinking 块
-              ├── delta.content             → text 块
-              ├── delta.tool_calls          → tool_use 块
-              ├── usage.cached_tokens       → cache_read_input_tokens
-              └── yield BetaRawMessageStreamEvent
+          ├── [Responses]
+          │   ├── anthropicMessagesToOpenAIResponsesInput()
+          │   ├── anthropicToolsToOpenAIResponses()
+          │   ├── openai.responses.create({ stream: true })
+          │   └── adaptOpenAIResponsesStreamToAnthropic()
+          └── [Chat]
+              ├── anthropicMessagesToOpenAI()
+              ├── anthropicToolsToOpenAI()
+              ├── openai.chat.completions.create({ stream: true })
+              └── adaptOpenAIStreamToAnthropic()
 ```
 
 ### 模型名解析优先级
@@ -119,16 +147,19 @@ queryModel() [claude.ts]
 src/services/api/openai/
 ├── client.ts              # OpenAI SDK 客户端工厂（~50 行）
 ├── convertMessages.ts     # Anthropic → OpenAI 消息格式转换（~190 行）
+├── responsesConvertMessages.ts # Anthropic → Responses input items
 ├── convertTools.ts        # Anthropic → OpenAI 工具格式转换（~70 行）
 ├── streamAdapter.ts       # SSE 流转换核心，含 thinking + caching（~270 行）
+├── responsesStreamAdapter.ts # Responses stream → Anthropic event
 ├── modelMapping.ts        # 模型名解析（~60 行）
 ├── index.ts               # 公共入口 queryModelOpenAI()（~110 行）
 └── __tests__/
     ├── convertMessages.test.ts   # 10 个测试
     ├── convertTools.test.ts      # 7 个测试
     ├── modelMapping.test.ts      # 6 个测试
-    └── streamAdapter.test.ts     # 14 个测试（含 thinking + caching）
-```
+    ├── streamAdapter.test.ts     # 14 个测试（含 thinking + caching）
+    └── responses.test.ts         # Responses 路由/输入/流测试
+``` 
 
 ### 修改文件
 
@@ -302,6 +333,33 @@ OpenAI chunks:
 
 **请求侧**：不需要显式配置。支持思维链的模型（DeepSeek 等）会自动返回 `delta.reasoning_content`。
 
+另外，针对 OpenAI 官方 reasoning 模型（如 GPT-5 / O 系列），兼容层现在会透传 `reasoning_effort`：
+
+- 显式环境变量：`OPENAI_REASONING_EFFORT=low|medium|high|xhigh|none|minimal`
+- 或沿用现有 `/effort`：
+  - `low -> low`
+  - `medium -> medium`
+  - `high -> high`
+  - `max -> xhigh`
+
+自动映射只会在识别为 OpenAI reasoning 模型时发送，避免把该参数误发给 `gpt-4o` 这类非 reasoning 模型。
+
+当走 **Responses API** 时，官方 OpenAI reasoning 模型使用的是：
+
+```json
+{
+  "reasoning": { "effort": "high" }
+}
+```
+
+当走 **Chat Completions** 路径时，使用的是：
+
+```json
+{
+  "reasoning_effort": "high"
+}
+```
+
 **响应侧**：`delta.reasoning_content` 被转换为 Anthropic `thinking` content block：
 
 ```ts
@@ -343,7 +401,7 @@ Anthropic: message_start.message.usage.cache_read_input_tokens = 800
 | Beta Headers | 不发送 |
 | Server Tools (advisor) | 不发送 |
 | Structured Output | 不发送 |
-| Fast Mode / Effort | 不发送 |
+| Fast Mode | 不发送 |
 | Tool Search / defer_loading | 不启用，所有工具直接发送 |
 | Anthropic Signature | thinking block 的 `signature` 字段为空字符串 |
 | cache_creation_input_tokens | 始终为 0（OpenAI 不区分创建/读取） |

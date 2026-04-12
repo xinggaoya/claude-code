@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test'
-import { anthropicToolsToOpenAI, anthropicToolChoiceToOpenAI } from '../convertTools.js'
+import {
+  anthropicToolsToOpenAI,
+  anthropicToolChoiceToOpenAI,
+  anthropicToolsToOpenAIResponses,
+} from '../convertTools.js'
 
 describe('anthropicToolsToOpenAI', () => {
   test('converts basic tool', () => {
@@ -163,5 +167,96 @@ describe('anthropicToolChoiceToOpenAI', () => {
 
   test('returns undefined for unknown type', () => {
     expect(anthropicToolChoiceToOpenAI({ type: 'unknown' })).toBeUndefined()
+  })
+})
+
+describe('anthropicToolsToOpenAIResponses', () => {
+  test('disables strict mode for responses tools with optional properties', () => {
+    const tools = [
+      {
+        type: 'custom',
+        name: 'edit',
+        description: 'Edit a file',
+        input_schema: {
+          type: 'object',
+          properties: {
+            file_path: { type: 'string' },
+            old_string: { type: 'string' },
+            new_string: { type: 'string' },
+            replace_all: { type: 'boolean' },
+          },
+          required: ['file_path', 'old_string', 'new_string'],
+          additionalProperties: false,
+        },
+      },
+    ]
+
+    const result = anthropicToolsToOpenAIResponses(tools as any)
+    const first = result?.[0]
+
+    expect(result).toBeDefined()
+    expect(result).toHaveLength(1)
+    expect(first).toBeDefined()
+    expect((first as any).strict).toBe(false)
+  })
+
+  test('disables strict mode for responses tools even when every property is required', () => {
+    const tools = [
+      {
+        type: 'custom',
+        name: 'write',
+        description: 'Write a file',
+        input_schema: {
+          type: 'object',
+          properties: {
+            file_path: { type: 'string' },
+            content: { type: 'string' },
+          },
+          required: ['file_path', 'content'],
+          additionalProperties: false,
+        },
+      },
+    ]
+
+    const result = anthropicToolsToOpenAIResponses(tools as any)
+    const first = result?.[0]
+
+    expect(result).toBeDefined()
+    expect(result).toHaveLength(1)
+    expect(first).toBeDefined()
+    expect((first as any).strict).toBe(false)
+  })
+
+  test('disables strict mode for responses tools with nested schemas', () => {
+    const tools = [
+      {
+        type: 'custom',
+        name: 'ask',
+        description: 'Ask a question',
+        input_schema: {
+          type: 'object',
+          properties: {
+            question: { type: 'string' },
+            metadata: {
+              type: 'object',
+              properties: {
+                source: { type: 'string' },
+                priority: { type: 'string' },
+              },
+              required: ['source'],
+            },
+          },
+          required: ['question', 'metadata'],
+        },
+      },
+    ]
+
+    const result = anthropicToolsToOpenAIResponses(tools as any)
+    const first = result?.[0]
+
+    expect(result).toBeDefined()
+    expect(result).toHaveLength(1)
+    expect(first).toBeDefined()
+    expect((first as any).strict).toBe(false)
   })
 })

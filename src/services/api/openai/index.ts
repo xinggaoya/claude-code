@@ -16,10 +16,17 @@ import type {
 import { getOpenAIClient } from './client.js'
 import { anthropicMessagesToOpenAI } from './convertMessages.js'
 import {
+  anthropicMessagesToOpenAIResponsesInput,
+  systemPromptToOpenAIInstructions,
+} from './responsesConvertMessages.js'
+import {
   anthropicToolsToOpenAI,
   anthropicToolChoiceToOpenAI,
+  anthropicToolChoiceToOpenAIResponses,
+  anthropicToolsToOpenAIResponses,
 } from './convertTools.js'
 import { adaptOpenAIStreamToAnthropic } from './streamAdapter.js'
+import { adaptOpenAIResponsesStreamToAnthropic } from './responsesStreamAdapter.js'
 import { resolveOpenAIModel } from './modelMapping.js'
 import { normalizeMessagesForAPI } from '../../../utils/messages.js'
 import { toolToAPISchema } from '../../../utils/api.js'
@@ -35,6 +42,10 @@ import { getModelMaxOutputTokens } from '../../../utils/context.js'
 import type { Options } from '../claude.js'
 import { randomUUID } from 'crypto'
 import {
+  resolveAppliedEffort,
+  type EffortValue,
+} from '../../../utils/effort.js'
+import {
   createAssistantAPIErrorMessage,
   normalizeContentFromAPI,
 } from '../../../utils/messages.js'
@@ -47,6 +58,7 @@ import {
   isDeferredTool,
   TOOL_SEARCH_TOOL_NAME,
 } from '../../../tools/ToolSearchTool/prompt.js'
+import { get3PModelCapabilityOverride } from '../../../utils/model/modelSupportOverrides.js'
 
 /**
  * Detect whether DeepSeek-style thinking mode should be enabled.
@@ -68,7 +80,198 @@ export function isOpenAIThinkingEnabled(model: string): boolean {
   if (isEnvTruthy(process.env.OPENAI_ENABLE_THINKING)) return true
   // Auto-detect from model name (deepseek-reasoner and DeepSeek-V3.2 support thinking mode)
   const modelLower = model.toLowerCase()
-  return modelLower.includes('deepseek-reasoner') || modelLower.includes('deepseek-v3.2')
+  return (
+    modelLower.includes('deepseek-reasoner') ||
+    modelLower.includes('deepseek-v3.2')
+  )
+}
+
+type OpenAIReasoningEffort = Exclude<
+  ChatCompletionCreateParamsStreaming['reasoning_effort'],
+  null | undefined
+>
+
+const OPENAI_REASONING_EFFORT_VALUES = [
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+] as const satisfies readonly OpenAIReasoningEffort[]
+
+export function isOpenAIReasoningEffort(
+  value: string,
+): value is OpenAIReasoningEffort {
+  return (OPENAI_REASONING_EFFORT_VALUES as readonly string[]).includes(
+    value.toLowerCase(),
+  )
+}
+
+/**
+ * OpenAI official reasoning effort is supported on reasoning-model families.
+ * We keep detection conservative to avoid sending `reasoning_effort` to
+ * non-reasoning chat models such as gpt-4o.
+ */
+export function modelSupportsOpenAIReasoningEffort(model: string): boolean {
+  const supported3P = get3PModelCapabilityOverride(model, 'effort')
+  if (supported3P !== undefined) {
+    return supported3P
+  }
+
+  const m = model.toLowerCase()
+  return /\bgpt-5(?:[.-]|$)/.test(m) || /\bo[1345](?:[.-]|$)/.test(m)
+}
+
+/**
+ * Parse OPENAI_REASONING_EFFORT env override.
+ *
+ * - `auto` / `unset` / empty => no explicit override
+ * - official values => forwarded as-is
+ * - invalid values => undefined (caller may log and ignore)
+ */
+export function parseOpenAIReasoningEffortEnv(
+  value: string | undefined,
+): OpenAIReasoningEffort | null | undefined {
+  if (value === undefined) {
+    return undefined
+  }
+
+  const normalized = value.trim().toLowerCase()
+  if (normalized === '' || normalized === 'auto' || normalized === 'unset') {
+    return null
+  }
+
+  return isOpenAIReasoningEffort(normalized) ? normalized : undefined
+}
+
+export function mapEffortToOpenAIReasoningEffort(
+  effortValue: EffortValue | undefined,
+): OpenAIReasoningEffort | undefined {
+  switch (effortValue) {
+    case 'low':
+      return 'low'
+    case 'medium':
+      return 'medium'
+    case 'high':
+      return 'high'
+    case 'max':
+      return 'xhigh'
+    default:
+      return undefined
+  }
+}
+
+/**
+ * Resolve the OpenAI `reasoning_effort` parameter.
+ *
+ * Priority:
+ * 1. OPENAI_REASONING_EFFORT env var (exact OpenAI values)
+ * 2. Existing Claude Code `/effort` state mapped to OpenAI semantics
+ *
+ * Automatic `/effort` mapping is only applied to recognized OpenAI reasoning
+ * models, so we don't accidentally send the parameter to non-reasoning models
+ * like gpt-4o. The env override is still honored explicitly so advanced users
+ * can force provider-specific behavior.
+ */
+export function resolveOpenAIReasoningEffort(params: {
+  anthropicModel: string
+  openaiModel: string
+  appEffortValue: EffortValue | undefined
+}): OpenAIReasoningEffort | undefined {
+  const envRaw = process.env.OPENAI_REASONING_EFFORT
+  const envParsed = parseOpenAIReasoningEffortEnv(envRaw)
+
+  if (envRaw !== undefined) {
+    if (envParsed === undefined) {
+      logForDebugging(
+        `[OpenAI] Ignoring invalid OPENAI_REASONING_EFFORT=${envRaw}. Valid values: none|minimal|low|medium|high|xhigh|auto|unset`,
+        { level: 'error' },
+      )
+      return undefined
+    }
+    return envParsed ?? undefined
+  }
+
+  if (!modelSupportsOpenAIReasoningEffort(params.openaiModel)) {
+    return undefined
+  }
+
+  const appliedEffort = resolveAppliedEffort(
+    params.anthropicModel,
+    params.appEffortValue,
+  )
+  return mapEffortToOpenAIReasoningEffort(appliedEffort)
+}
+
+export function looksLikeOfficialOpenAIModel(model: string): boolean {
+  const m = model.toLowerCase()
+  return (
+    m.startsWith('gpt-') ||
+    /^o[1345](?:[.-]|$)/.test(m) ||
+    m.startsWith('chatgpt-') ||
+    m.startsWith('codex-')
+  )
+}
+
+export function shouldUseOpenAIResponsesAPI(model: string): boolean {
+  if (isEnvTruthy(process.env.OPENAI_USE_CHAT_COMPLETIONS)) {
+    return false
+  }
+  if (isEnvTruthy(process.env.OPENAI_USE_RESPONSES)) {
+    return true
+  }
+  if (!looksLikeOfficialOpenAIModel(model)) {
+    return false
+  }
+
+  const baseURL = process.env.OPENAI_BASE_URL
+  if (!baseURL) {
+    return true
+  }
+
+  try {
+    const host = new URL(baseURL).host.toLowerCase()
+    return host === 'api.openai.com' || host.endsWith('.openai.com')
+  } catch {
+    return false
+  }
+}
+
+export function shouldFallbackFromResponsesError(error: unknown): boolean {
+  const status =
+    error &&
+    typeof error === 'object' &&
+    'status' in error &&
+    typeof error.status === 'number'
+      ? error.status
+      : undefined
+
+  const message =
+    error instanceof Error
+      ? error.message.toLowerCase()
+      : String(error).toLowerCase()
+
+  if (
+    status === 404 ||
+    status === 405 ||
+    status === 501 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504
+  ) {
+    return true
+  }
+
+  return (
+    message.includes('upstream request failed') ||
+    message.includes('/responses') ||
+    message.includes('not found') ||
+    message.includes('method not allowed') ||
+    message.includes('unsupported') ||
+    message.includes('not implemented') ||
+    message.includes('bad gateway')
+  )
 }
 
 /**
@@ -89,6 +292,7 @@ export function buildOpenAIRequestBody(params: {
   tools: any[]
   toolChoice: any
   enableThinking: boolean
+  reasoningEffort?: OpenAIReasoningEffort
   maxTokens: number
   temperatureOverride?: number
 }): ChatCompletionCreateParamsStreaming & {
@@ -96,7 +300,16 @@ export function buildOpenAIRequestBody(params: {
   enable_thinking?: boolean
   chat_template_kwargs?: { thinking: boolean }
 } {
-  const { model, messages, tools, toolChoice, enableThinking, maxTokens, temperatureOverride } = params
+  const {
+    model,
+    messages,
+    tools,
+    toolChoice,
+    enableThinking,
+    reasoningEffort,
+    maxTokens,
+    temperatureOverride,
+  } = params
   return {
     model,
     messages,
@@ -107,6 +320,9 @@ export function buildOpenAIRequestBody(params: {
     }),
     stream: true,
     stream_options: { include_usage: true },
+    ...(reasoningEffort !== undefined && {
+      reasoning_effort: reasoningEffort,
+    }),
     // DeepSeek thinking mode: enable chain-of-thought output.
     // When active, temperature/top_p/presence_penalty/frequency_penalty are ignored by DeepSeek.
     ...(enableThinking && {
@@ -118,7 +334,46 @@ export function buildOpenAIRequestBody(params: {
     }),
     // Only send temperature when thinking mode is off (DeepSeek ignores it anyway,
     // but other providers may respect it)
-    ...(!enableThinking && temperatureOverride !== undefined && {
+    ...(!enableThinking &&
+      temperatureOverride !== undefined && {
+        temperature: temperatureOverride,
+      }),
+  }
+}
+
+export function buildOpenAIResponsesRequestBody(params: {
+  model: string
+  instructions?: string
+  input: any[]
+  tools?: any[]
+  toolChoice?: any
+  reasoningEffort?: OpenAIReasoningEffort
+  maxTokens: number
+  temperatureOverride?: number
+}) {
+  const {
+    model,
+    instructions,
+    input,
+    tools,
+    toolChoice,
+    reasoningEffort,
+    maxTokens,
+    temperatureOverride,
+  } = params
+
+  return {
+    model,
+    ...(instructions && { instructions }),
+    input,
+    max_output_tokens: maxTokens,
+    stream: true,
+    ...(tools && tools.length > 0 && { tools }),
+    ...(toolChoice !== undefined && { tool_choice: toolChoice }),
+    ...(reasoningEffort !== undefined && {
+      reasoning: { effort: reasoningEffort },
+    }),
+    ...(temperatureOverride !== undefined && {
       temperature: temperatureOverride,
     }),
   }
@@ -134,11 +389,24 @@ function assembleFinalAssistantOutputs(params: {
   contentBlocks: Record<number, any>
   tools: Tools
   agentId: string | undefined
-  usage: { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number }
+  usage: {
+    input_tokens: number
+    output_tokens: number
+    cache_creation_input_tokens: number
+    cache_read_input_tokens: number
+  }
   stopReason: string | null
   maxTokens: number
 }): (AssistantMessage | SystemAPIErrorMessage)[] {
-  const { partialMessage, contentBlocks, tools, agentId, usage, stopReason, maxTokens } = params
+  const {
+    partialMessage,
+    contentBlocks,
+    tools,
+    agentId,
+    usage,
+    stopReason,
+    maxTokens,
+  } = params
   const outputs: (AssistantMessage | SystemAPIErrorMessage)[] = []
 
   const allBlocks = Object.keys(contentBlocks)
@@ -150,7 +418,11 @@ function assembleFinalAssistantOutputs(params: {
     outputs.push({
       message: {
         ...partialMessage,
-        content: normalizeContentFromAPI(allBlocks, tools, agentId as AgentId | undefined),
+        content: normalizeContentFromAPI(
+          allBlocks,
+          tools,
+          agentId as AgentId | undefined,
+        ),
         usage,
         stop_reason: stopReason,
         stop_sequence: null,
@@ -163,12 +435,15 @@ function assembleFinalAssistantOutputs(params: {
   }
 
   if (stopReason === 'max_tokens') {
-    outputs.push(createAssistantAPIErrorMessage({
-      content: `Output truncated: response exceeded the ${maxTokens} token limit. ` +
-        `Set CLAUDE_CODE_MAX_OUTPUT_TOKENS to override.`,
-      apiError: 'max_output_tokens',
-      error: 'max_output_tokens',
-    }))
+    outputs.push(
+      createAssistantAPIErrorMessage({
+        content:
+          `Output truncated: response exceeded the ${maxTokens} token limit. ` +
+          `Set CLAUDE_CODE_MAX_OUTPUT_TOKENS to override.`,
+        apiError: 'max_output_tokens',
+        error: 'max_output_tokens',
+      }),
+    )
   }
 
   return outputs
@@ -254,25 +529,24 @@ export async function* queryModelOpenAI(
       },
     )
 
-    // 8. Convert messages and tools to OpenAI format
-    const enableThinking = isOpenAIThinkingEnabled(openaiModel)
-    const openaiMessages = anthropicMessagesToOpenAI(messagesForAPI, systemPrompt, {
-      enableThinking,
+    const reasoningEffort = resolveOpenAIReasoningEffort({
+      anthropicModel: options.model,
+      openaiModel,
+      appEffortValue: options.effortValue,
     })
-    const openaiTools = anthropicToolsToOpenAI(standardTools)
-    const openaiToolChoice = anthropicToolChoiceToOpenAI(options.toolChoice)
+    const useResponsesAPI = shouldUseOpenAIResponsesAPI(openaiModel)
 
-    // 9. Log tool filtering details
+    // 8. Log tool filtering details
     if (useToolSearch) {
       const includedDeferredTools = filteredTools.filter(t =>
         deferredToolNames.has(t.name),
       ).length
       logForDebugging(
-        `[OpenAI] Tool search enabled: ${includedDeferredTools}/${deferredToolNames.size} deferred tools included, total tools=${openaiTools.length}`,
+        `[OpenAI] Tool search enabled: ${includedDeferredTools}/${deferredToolNames.size} deferred tools included, provider=openai route=${useResponsesAPI ? 'responses' : 'chat-completions'}`,
       )
     } else {
       logForDebugging(
-        `[OpenAI] Tool search disabled, total tools=${openaiTools.length}`,
+        `[OpenAI] Tool search disabled, provider=openai route=${useResponsesAPI ? 'responses' : 'chat-completions'}`,
       )
     }
 
@@ -296,28 +570,86 @@ export async function* queryModelOpenAI(
       source: options.querySource,
     })
 
-    logForDebugging(
-      `[OpenAI] Calling model=${openaiModel}, messages=${openaiMessages.length}, tools=${openaiTools.length}, thinking=${enableThinking}`,
-    )
+    let adaptedStream: AsyncIterable<any> | undefined
+    let usedResponsesAPI = false
+    if (useResponsesAPI) {
+      const responseInput = anthropicMessagesToOpenAIResponsesInput(messagesForAPI)
+      const responseTools = anthropicToolsToOpenAIResponses(standardTools)
+      const responseToolChoice = anthropicToolChoiceToOpenAIResponses(
+        options.toolChoice,
+      )
+      const responseInstructions =
+        systemPromptToOpenAIInstructions(systemPrompt)
 
-    // 12. Call OpenAI API with streaming
-    const requestBody = buildOpenAIRequestBody({
-      model: openaiModel,
-      messages: openaiMessages,
-      tools: openaiTools,
-      toolChoice: openaiToolChoice,
-      enableThinking,
-      maxTokens,
-      temperatureOverride: options.temperatureOverride,
-    })
-    const stream = await client.chat.completions.create(
-      requestBody,
-      { signal },
-    )
+      logForDebugging(
+        `[OpenAI] Calling Responses API model=${openaiModel}, input_items=${responseInput.length}, tools=${responseTools?.length ?? 0}, reasoning_effort=${reasoningEffort ?? 'default'}`,
+      )
 
-    // 12. Convert OpenAI stream to Anthropic events, then process into
-    //     AssistantMessage + StreamEvent (matching the Anthropic path behavior)
-    const adaptedStream = adaptOpenAIStreamToAnthropic(stream, openaiModel)
+      const requestBody = buildOpenAIResponsesRequestBody({
+        model: openaiModel,
+        instructions: responseInstructions,
+        input: responseInput,
+        tools: responseTools,
+        toolChoice: responseToolChoice,
+        reasoningEffort,
+        maxTokens,
+        temperatureOverride: options.temperatureOverride,
+      })
+      try {
+        const stream = await client.responses.create(requestBody, { signal })
+        adaptedStream = adaptOpenAIResponsesStreamToAnthropic(
+          stream as AsyncIterable<any>,
+          openaiModel,
+        )
+        usedResponsesAPI = true
+      } catch (error) {
+        if (!shouldFallbackFromResponsesError(error)) {
+          throw error
+        }
+        const errorMessage =
+          error instanceof Error ? error.message : String(error)
+        logForDebugging(
+          `[OpenAI] Responses API failed for model=${openaiModel}; falling back to Chat Completions. Error: ${errorMessage}`,
+          { level: 'error' },
+        )
+      }
+    }
+
+    if (!usedResponsesAPI) {
+      const enableThinking = isOpenAIThinkingEnabled(openaiModel)
+      const openaiMessages = anthropicMessagesToOpenAI(
+        messagesForAPI,
+        systemPrompt,
+        {
+          enableThinking,
+        },
+      )
+      const openaiTools = anthropicToolsToOpenAI(standardTools)
+      const openaiToolChoice = anthropicToolChoiceToOpenAI(options.toolChoice)
+
+      logForDebugging(
+        `[OpenAI] Calling Chat Completions model=${openaiModel}, messages=${openaiMessages.length}, tools=${openaiTools.length}, thinking=${enableThinking}, reasoning_effort=${reasoningEffort ?? 'default'}`,
+      )
+
+      const requestBody = buildOpenAIRequestBody({
+        model: openaiModel,
+        messages: openaiMessages,
+        tools: openaiTools,
+        toolChoice: openaiToolChoice,
+        enableThinking,
+        reasoningEffort,
+        maxTokens,
+        temperatureOverride: options.temperatureOverride,
+      })
+      const stream = await client.chat.completions.create(requestBody, {
+        signal,
+      })
+      adaptedStream = adaptOpenAIStreamToAnthropic(stream, openaiModel)
+    }
+
+    if (!adaptedStream) {
+      throw new Error('OpenAI adapter failed to initialize a streaming route')
+    }
 
     // Accumulate content blocks and usage, same as the Anthropic path in claude.ts
     const contentBlocks: Record<number, any> = {}
@@ -395,8 +727,13 @@ export async function* queryModelOpenAI(
           // here and injected so tokenCountWithEstimation() can read it.
           if (partialMessage) {
             for (const output of assembleFinalAssistantOutputs({
-              partialMessage, contentBlocks, tools, agentId: options.agentId,
-              usage, stopReason, maxTokens,
+              partialMessage,
+              contentBlocks,
+              tools,
+              agentId: options.agentId,
+              usage,
+              stopReason,
+              maxTokens,
             })) {
               yield output
             }
@@ -424,8 +761,13 @@ export async function* queryModelOpenAI(
     // Safety: if stream ended without message_stop, assemble and yield whatever we have
     if (partialMessage) {
       for (const output of assembleFinalAssistantOutputs({
-        partialMessage, contentBlocks, tools, agentId: options.agentId,
-        usage, stopReason, maxTokens,
+        partialMessage,
+        contentBlocks,
+        tools,
+        agentId: options.agentId,
+        usage,
+        stopReason,
+        maxTokens,
       })) {
         yield output
       }
@@ -436,7 +778,9 @@ export async function* queryModelOpenAI(
     yield createAssistantAPIErrorMessage({
       content: `API Error: ${errorMessage}`,
       apiError: 'api_error',
-      error: (error instanceof Error ? error : new Error(String(error))) as unknown as SDKAssistantMessageError,
+      error: (error instanceof Error
+        ? error
+        : new Error(String(error))) as unknown as SDKAssistantMessageError,
     })
   }
 }

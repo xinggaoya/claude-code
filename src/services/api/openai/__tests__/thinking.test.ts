@@ -1,5 +1,12 @@
 import { describe, expect, test, beforeEach, afterEach } from 'bun:test'
-import { isOpenAIThinkingEnabled, buildOpenAIRequestBody } from '../index.js'
+import {
+  buildOpenAIRequestBody,
+  isOpenAIThinkingEnabled,
+  mapEffortToOpenAIReasoningEffort,
+  modelSupportsOpenAIReasoningEffort,
+  parseOpenAIReasoningEffortEnv,
+  resolveOpenAIReasoningEffort,
+} from '../index.js'
 
 describe('isOpenAIThinkingEnabled', () => {
   const originalEnv = {
@@ -81,7 +88,9 @@ describe('isOpenAIThinkingEnabled', () => {
     })
 
     test('returns true when model name is namespaced for deepseek-reasoner', () => {
-      expect(isOpenAIThinkingEnabled('TokenService/deepseek-reasoner')).toBe(true)
+      expect(isOpenAIThinkingEnabled('TokenService/deepseek-reasoner')).toBe(
+        true,
+      )
     })
 
     test('returns true when model name is "deepseek-v3.2"', () => {
@@ -172,16 +181,32 @@ describe('buildOpenAIRequestBody — thinking params', () => {
   })
 
   test('does NOT include thinking params when disabled', () => {
-    const body = buildOpenAIRequestBody({ ...baseParams, enableThinking: false })
+    const body = buildOpenAIRequestBody({
+      ...baseParams,
+      enableThinking: false,
+    })
     expect(body.thinking).toBeUndefined()
     expect(body.enable_thinking).toBeUndefined()
     expect(body.chat_template_kwargs).toBeUndefined()
   })
 
   test('always includes stream and stream_options', () => {
-    const body = buildOpenAIRequestBody({ ...baseParams, enableThinking: false })
+    const body = buildOpenAIRequestBody({
+      ...baseParams,
+      enableThinking: false,
+    })
     expect(body.stream).toBe(true)
     expect(body.stream_options).toEqual({ include_usage: true })
+  })
+
+  test('includes reasoning_effort when provided', () => {
+    const body = buildOpenAIRequestBody({
+      ...baseParams,
+      model: 'gpt-5.4',
+      enableThinking: false,
+      reasoningEffort: 'xhigh',
+    })
+    expect(body.reasoning_effort).toBe('xhigh')
   })
 
   test('includes temperature when thinking is off and override is set', () => {
@@ -203,7 +228,10 @@ describe('buildOpenAIRequestBody — thinking params', () => {
   })
 
   test('excludes temperature when thinking is off and no override', () => {
-    const body = buildOpenAIRequestBody({ ...baseParams, enableThinking: false })
+    const body = buildOpenAIRequestBody({
+      ...baseParams,
+      enableThinking: false,
+    })
     expect(body.temperature).toBeUndefined()
   })
 
@@ -219,8 +247,85 @@ describe('buildOpenAIRequestBody — thinking params', () => {
   })
 
   test('excludes tools when empty', () => {
-    const body = buildOpenAIRequestBody({ ...baseParams, enableThinking: false })
+    const body = buildOpenAIRequestBody({
+      ...baseParams,
+      enableThinking: false,
+    })
     expect(body.tools).toBeUndefined()
     expect(body.tool_choice).toBeUndefined()
+  })
+})
+
+describe('OpenAI reasoning_effort helpers', () => {
+  const originalEnv = {
+    OPENAI_REASONING_EFFORT: process.env.OPENAI_REASONING_EFFORT,
+  }
+
+  beforeEach(() => {
+    delete process.env.OPENAI_REASONING_EFFORT
+  })
+
+  afterEach(() => {
+    if (originalEnv.OPENAI_REASONING_EFFORT === undefined) {
+      delete process.env.OPENAI_REASONING_EFFORT
+    } else {
+      process.env.OPENAI_REASONING_EFFORT = originalEnv.OPENAI_REASONING_EFFORT
+    }
+  })
+
+  test('parses env override values', () => {
+    expect(parseOpenAIReasoningEffortEnv('xhigh')).toBe('xhigh')
+    expect(parseOpenAIReasoningEffortEnv('HIGH')).toBe('high')
+    expect(parseOpenAIReasoningEffortEnv('auto')).toBeNull()
+    expect(parseOpenAIReasoningEffortEnv('unset')).toBeNull()
+    expect(parseOpenAIReasoningEffortEnv('nope')).toBeUndefined()
+  })
+
+  test('detects supported reasoning-model families conservatively', () => {
+    expect(modelSupportsOpenAIReasoningEffort('gpt-5.4')).toBe(true)
+    expect(modelSupportsOpenAIReasoningEffort('gpt-5-mini')).toBe(true)
+    expect(modelSupportsOpenAIReasoningEffort('o3')).toBe(true)
+    expect(modelSupportsOpenAIReasoningEffort('o4-mini')).toBe(true)
+    expect(modelSupportsOpenAIReasoningEffort('gpt-4o')).toBe(false)
+    expect(modelSupportsOpenAIReasoningEffort('deepseek-reasoner')).toBe(false)
+  })
+
+  test('maps existing effort levels to OpenAI semantics', () => {
+    expect(mapEffortToOpenAIReasoningEffort('low')).toBe('low')
+    expect(mapEffortToOpenAIReasoningEffort('medium')).toBe('medium')
+    expect(mapEffortToOpenAIReasoningEffort('high')).toBe('high')
+    expect(mapEffortToOpenAIReasoningEffort('max')).toBe('xhigh')
+    expect(mapEffortToOpenAIReasoningEffort(undefined)).toBeUndefined()
+  })
+
+  test('uses explicit OPENAI_REASONING_EFFORT override when set', () => {
+    process.env.OPENAI_REASONING_EFFORT = 'xhigh'
+    expect(
+      resolveOpenAIReasoningEffort({
+        anthropicModel: 'claude-sonnet-4-6',
+        openaiModel: 'gpt-4o',
+        appEffortValue: 'low',
+      }),
+    ).toBe('xhigh')
+  })
+
+  test('maps /effort to reasoning_effort for recognized reasoning models', () => {
+    expect(
+      resolveOpenAIReasoningEffort({
+        anthropicModel: 'claude-opus-4-6',
+        openaiModel: 'gpt-5.4',
+        appEffortValue: 'max',
+      }),
+    ).toBe('xhigh')
+  })
+
+  test('does not auto-send reasoning_effort to non-reasoning models', () => {
+    expect(
+      resolveOpenAIReasoningEffort({
+        anthropicModel: 'claude-sonnet-4-6',
+        openaiModel: 'gpt-4o',
+        appEffortValue: 'high',
+      }),
+    ).toBeUndefined()
   })
 })

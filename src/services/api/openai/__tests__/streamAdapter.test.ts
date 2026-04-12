@@ -1,5 +1,4 @@
 import { describe, expect, test } from 'bun:test'
-import { adaptOpenAIStreamToAnthropic } from '../streamAdapter.js'
 import type { ChatCompletionChunk } from 'openai/resources/chat/completions/completions.mjs'
 
 /** Helper to create a mock async iterable from chunk array */
@@ -30,8 +29,13 @@ function makeChunk(overrides: Partial<ChatCompletionChunk> & any = {}): ChatComp
 }
 
 /** Collect all emitted Anthropic events from the stream adapter for assertion */
+let adapterImportCounter = 0
+
 async function collectEvents(chunks: ChatCompletionChunk[]) {
   const events: any[] = []
+  const { adaptOpenAIStreamToAnthropic } = await import(
+    `../streamAdapter.js?stream-adapter-test-real=${adapterImportCounter++}`
+  )
   for await (const event of adaptOpenAIStreamToAnthropic(mockStream(chunks), 'gpt-4o')) {
     events.push(event)
   }

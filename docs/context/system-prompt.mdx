@@ -311,7 +311,12 @@ Claude Code 提供了 OpenAI 和 Gemini 协议的兼容层，允许使用非 Ant
 
 ### OpenAI 兼容层
 
-通过 `CLAUDE_CODE_USE_OPENAI=1` 启用，支持任意 OpenAI Chat Completions 协议端点（Ollama、DeepSeek、vLLM 等）。
+通过 `CLAUDE_CODE_USE_OPENAI=1` 启用。
+
+当前 `openai` provider 采用双路径：
+
+- **官方 OpenAI 模型** 默认优先走 **Responses API**
+- **OpenAI-compatible 网关** 默认继续走 **Chat Completions API**
 
 实现采用**流适配器模式**：
 1. 将 Anthropic 格式请求转换为 OpenAI 格式
@@ -334,6 +339,9 @@ src/services/api/openai/
 - `OPENAI_API_KEY` — API 密钥
 - `OPENAI_BASE_URL` — API 端点（默认 `https://api.openai.com/v1`）
 - `OPENAI_MODEL` — 直接指定模型名
+- `OPENAI_REASONING_EFFORT` — 给 OpenAI reasoning 模型显式设置 `reasoning_effort`（如 `low` / `high` / `xhigh`）
+- `OPENAI_USE_RESPONSES=1` — 强制使用 Responses API
+- `OPENAI_USE_CHAT_COMPLETIONS=1` — 强制使用 Chat Completions API
 
 ### Gemini 兼容层
 

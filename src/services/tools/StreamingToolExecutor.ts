@@ -6,7 +6,6 @@ import {
 } from 'src/utils/messages.js'
 import type { CanUseToolFn } from '../../hooks/useCanUseTool.js'
 import { findToolByName, type Tools, type ToolUseContext } from '../../Tool.js'
-import { BASH_TOOL_NAME } from '../../tools/BashTool/toolName.js'
 import type { AssistantMessage, Message } from '../../types/message.js'
 import { createChildAbortController } from '../../utils/abortController.js'
 import { runToolUse } from './toolExecution.js'
@@ -40,12 +39,6 @@ type TrackedTool = {
 export class StreamingToolExecutor {
   private tools: TrackedTool[] = []
   private toolUseContext: ToolUseContext
-  private hasErrored = false
-  private erroredToolDescription = ''
-  // Child of toolUseContext.abortController. Fires when a Bash tool errors
-  // so sibling subprocesses die immediately instead of running to completion.
-  // Aborting this does NOT abort the parent — query.ts won't end the turn.
-  private siblingAbortController: AbortController
   private discarded = false
   // Signal to wake up getRemainingResults when progress is available
   private progressAvailableResolve?: () => void
@@ -56,9 +49,6 @@ export class StreamingToolExecutor {
     toolUseContext: ToolUseContext,
   ) {
     this.toolUseContext = toolUseContext
-    this.siblingAbortController = createChildAbortController(
-      toolUseContext.abortController,
-    )
   }
 
   /**
@@ -152,7 +142,7 @@ export class StreamingToolExecutor {
 
   private createSyntheticErrorMessage(
     toolUseId: string,
-    reason: 'sibling_error' | 'user_interrupted' | 'streaming_fallback',
+    reason: 'user_interrupted' | 'streaming_fallback',
     assistantMessage: AssistantMessage,
   ): Message {
     // For user interruptions (ESC to reject), use REJECT_MESSAGE so the UI shows
@@ -186,22 +176,9 @@ export class StreamingToolExecutor {
         sourceToolAssistantUUID: assistantMessage.uuid,
       })
     }
-    const desc = this.erroredToolDescription
-    const msg = desc
-      ? `Cancelled: parallel tool call ${desc} errored`
-      : 'Cancelled: parallel tool call errored'
-    return createUserMessage({
-      content: [
-        {
-          type: 'tool_result',
-          content: `<tool_use_error>${msg}</tool_use_error>`,
-          is_error: true,
-          tool_use_id: toolUseId,
-        },
-      ],
-      toolUseResult: msg,
-      sourceToolAssistantUUID: assistantMessage.uuid,
-    })
+
+    const exhaustiveCheck: never = reason
+    throw new Error(`Unknown synthetic error reason: ${exhaustiveCheck}`)
   }
 
   /**
@@ -209,12 +186,9 @@ export class StreamingToolExecutor {
    */
   private getAbortReason(
     tool: TrackedTool,
-  ): 'sibling_error' | 'user_interrupted' | 'streaming_fallback' | null {
+  ): 'user_interrupted' | 'streaming_fallback' | null {
     if (this.discarded) {
       return 'streaming_fallback'
-    }
-    if (this.hasErrored) {
-      return 'sibling_error'
     }
     if (this.toolUseContext.abortController.signal.aborted) {
       // 'interrupt' means the user typed a new message while tools were
@@ -238,17 +212,6 @@ export class StreamingToolExecutor {
     } catch {
       return 'block'
     }
-  }
-
-  private getToolDescription(tool: TrackedTool): string {
-    const input = tool.block.input as Record<string, unknown> | undefined
-    const summary = input?.command ?? input?.file_path ?? input?.pattern ?? ''
-    if (typeof summary === 'string' && summary.length > 0) {
-      const truncated =
-        summary.length > 40 ? summary.slice(0, 40) + '\u2026' : summary
-      return `${tool.block.name}(${truncated})`
-    }
-    return tool.block.name
   }
 
   private updateInterruptibleState(): void {
@@ -292,20 +255,19 @@ export class StreamingToolExecutor {
       }
 
       // Per-tool child controller. Lets siblingAbortController kill running
-      // subprocesses (Bash spawns listen to this signal) when a Bash error
-      // cascades. Permission-dialog rejection also aborts this controller
-      // (PermissionContext.ts cancelAndAbort) — that abort must bubble up to
-      // the query controller so the query loop's post-tool abort check ends
-      // the turn. Without bubble-up, ExitPlanMode "clear context + auto"
-      // sends REJECT_MESSAGE to the model instead of aborting (#21056 regression).
+      // subprocesses when the parent query is interrupted. Permission-dialog
+      // rejection also aborts this controller (PermissionContext.ts
+      // cancelAndAbort) — that abort must bubble up to the query controller so
+      // the query loop's post-tool abort check ends the turn. Without
+      // bubble-up, ExitPlanMode "clear context + auto" sends REJECT_MESSAGE to
+      // the model instead of aborting (#21056 regression).
       const toolAbortController = createChildAbortController(
-        this.siblingAbortController,
+        this.toolUseContext.abortController,
       )
       toolAbortController.signal.addEventListener(
         'abort',
         () => {
           if (
-            toolAbortController.signal.reason !== 'sibling_error' &&
             !this.toolUseContext.abortController.signal.aborted &&
             !this.discarded
           ) {
@@ -325,8 +287,8 @@ export class StreamingToolExecutor {
       )
 
       // Track if this specific tool has produced an error result.
-      // This prevents the tool from receiving a duplicate "sibling error"
-      // message when it is the one that caused the error.
+      // This prevents the tool from receiving a duplicate synthetic
+      // interruption/fallback message after it has already yielded an error.
       let thisToolErrored = false
 
       for await (const update of generator) {
@@ -353,14 +315,6 @@ export class StreamingToolExecutor {
 
         if (isErrorResult) {
           thisToolErrored = true
-          // Only Bash errors cancel siblings. Bash commands often have implicit
-          // dependency chains (e.g. mkdir fails → subsequent commands pointless).
-          // Read/WebFetch/etc are independent — one failure shouldn't nuke the rest.
-          if (tool.block.name === BASH_TOOL_NAME) {
-            this.hasErrored = true
-            this.erroredToolDescription = this.getToolDescription(tool)
-            this.siblingAbortController.abort('sibling_error')
-          }
         }
 
         if (update.message) {

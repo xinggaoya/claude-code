@@ -6,6 +6,12 @@ let mockedModelType: "gemini" | undefined;
 mock.module("../../settings/settings.js", () => ({
   getInitialSettings: () =>
     mockedModelType ? { modelType: mockedModelType } : {},
+  getSettingsForSource: () => undefined,
+  getSettings_DEPRECATED: () => ({}),
+  getSettingsWithErrors: () => ({
+    settings: mockedModelType ? { modelType: mockedModelType } : {},
+    errors: [],
+  }),
 }));
 
 const { getAPIProvider, isFirstPartyAnthropicBaseUrl } =
